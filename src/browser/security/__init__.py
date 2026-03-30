@@ -1,0 +1,1 @@
+# Segurança do Redux Browser

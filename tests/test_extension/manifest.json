@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "Redux Test Extension",
+  "version": "1.0",
+  "description": "Extensão de teste do Redux Browser",
+  "content_scripts": [{
+    "matches": ["<all_urls>"],
+    "js": ["content.js"],
+    "css": ["style.css"],
+    "run_at": "document_end"
+  }],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Redux Test"
+  },
+  "permissions": ["storage", "activeTab"]
+}
