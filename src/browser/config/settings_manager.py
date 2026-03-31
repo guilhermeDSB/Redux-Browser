@@ -30,6 +30,7 @@ class SettingsManager:
         "adblock_whitelist": [],
         "adblock_custom_filters": "",
         "adblock_lists": {},
+        "onboarding_completed": False,
     }
     
     def __init__(self, settings_path: str = "~/.redux_browser/preferences.json"):

@@ -467,6 +467,54 @@ class MainWindow(QMainWindow):
         
         self.new_tab()
         
+        # Onboarding — exibir wizard na primeira execução
+        if not self._settings.get("onboarding_completed", False):
+            QTimer.singleShot(300, self._show_onboarding)
+        
+    def _show_onboarding(self):
+        """Exibe o wizard de primeiro uso."""
+        from browser.ui.onboarding import OnboardingWizard
+        wizard = OnboardingWizard(parent=self)
+        wizard.finished_setup.connect(self._apply_onboarding_choices)
+        wizard.exec()
+
+    def _apply_onboarding_choices(self, choices: dict):
+        """Aplica as escolhas feitas no onboarding ao browser."""
+        # Tema
+        new_theme = choices.get("theme", self.current_theme)
+        if new_theme != self.current_theme:
+            self.current_theme = new_theme
+            self.apply_theme()
+            # Atualizar ícones da toolbar como toggle_theme faz
+            if new_theme == "light":
+                self.theme_action.setText("Tema Escuro")
+                self.theme_action.setIcon(self._create_icon(Icons.MOON))
+            else:
+                self.theme_action.setText("Tema Claro")
+                self.theme_action.setIcon(self._create_icon(Icons.SUN))
+            # Recriar ícones principais da toolbar
+            self.back_btn.setIcon(self._create_icon(Icons.BACK))
+            self.forward_btn.setIcon(self._create_icon(Icons.FORWARD))
+            self.reload_btn.setIcon(self._create_icon(Icons.RELOAD))
+            self.home_btn.setIcon(self._create_icon(Icons.HOME))
+            self.fav_btn.setIcon(self._create_icon(Icons.STAR))
+            self.shield_btn.setIcon(self._create_icon(Icons.SHIELD))
+            self.adblock_btn.setIcon(self._create_icon(Icons.ADBLOCK))
+            self.menu_btn.setIcon(self._create_icon(Icons.MENU))
+
+        # Farbling
+        farbling = choices.get("farbling_level", "balanced")
+        try:
+            self.farbling_engine.level = FarblingLevel(farbling)
+        except ValueError:
+            pass
+
+        # AdBlock
+        adblock = choices.get("adblock_level", "standard")
+        try:
+            self.adblock_engine.level = AdBlockLevel(adblock)
+        except ValueError:
+            pass
     def _setup_find_bar(self):
         """Setup da barra de busca (Ctrl+F)."""
         from PyQt6.QtWidgets import QPushButton

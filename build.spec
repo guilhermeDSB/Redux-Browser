@@ -95,6 +95,8 @@ a = Analysis(
         'browser.security.adblock_engine',
         'browser.security.adblock_interceptor',
         'browser.security.adblock_injector',
+        'browser.security.adblock_tokenizer',
+        'browser.security.adblock_request',
         'browser.ui.adblock_panel',
         'browser.cache.cache_manager',
         'browser.history.history_manager',
