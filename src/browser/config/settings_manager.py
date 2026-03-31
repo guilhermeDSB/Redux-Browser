@@ -25,6 +25,11 @@ class SettingsManager:
         "download_path": "",
         "last_window_width": 1280,
         "last_window_height": 800,
+        "adblock_enabled": True,
+        "adblock_level": "standard",
+        "adblock_whitelist": [],
+        "adblock_custom_filters": "",
+        "adblock_lists": {},
     }
     
     def __init__(self, settings_path: str = "~/.redux_browser/preferences.json"):

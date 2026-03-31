@@ -32,7 +32,11 @@ from browser.config.search_engines import get_current_engine, build_search_url, 
 
 from browser.security.brave_farbling import FarblingEngine, FarblingLevel
 from browser.security.farbling_injector import FarblingInjector
+from browser.security.adblock_engine import AdBlockEngine, AdBlockLevel
+from browser.security.adblock_interceptor import AdBlockInterceptor
+from browser.security.adblock_injector import AdBlockInjector
 from browser.ui.fingerprint_panel import FingerprintPanel
+from browser.ui.adblock_panel import AdBlockPanel
 from browser.ui.theme import Theme
 from browser.ui.icons import Icons
 from browser.config.settings_manager import get_settings
@@ -61,6 +65,10 @@ class MainWindow(QMainWindow):
             self.farbling_engine.level = FarblingLevel.MAXIMUM
         self.farbling_injector = FarblingInjector(self.farbling_engine)
         
+        # Security: Ad Blocker
+        self.adblock_engine = AdBlockEngine()
+        self.adblock_injector = AdBlockInjector(self.adblock_engine)
+        
         private_str = " (Privado)" if self.is_private else ""
         self.setWindowTitle(f"Redux Browser{private_str}")
         self.setMinimumSize(1024, 768)
@@ -75,6 +83,15 @@ class MainWindow(QMainWindow):
             self.farbling_engine.level = FarblingLevel(saved_farbling)
         except ValueError:
             pass
+        
+        # Restaurar config do adblock salva
+        saved_adblock = self._settings.get("adblock_level", "standard")
+        try:
+            self.adblock_engine.level = AdBlockLevel(saved_adblock)
+        except ValueError:
+            pass
+        saved_whitelist = self._settings.get("adblock_whitelist", [])
+        self.adblock_engine.set_whitelist(saved_whitelist)
         
         self.apply_theme()
         
@@ -95,6 +112,9 @@ class MainWindow(QMainWindow):
         
         # Conectar download requests
         self._setup_downloads()
+        
+        # Instalar interceptor de ad block no profile
+        self._setup_adblock()
         
         # Auto-update: verificar atualizações após o startup
         self._update_manager = UpdateManager(parent=self)
@@ -333,6 +353,28 @@ class MainWindow(QMainWindow):
         self.shield_btn.triggered.connect(self.show_fingerprint_panel)
         self.toolbar.addAction(self.shield_btn)
         
+        self.adblock_btn = QAction(self._create_icon(Icons.ADBLOCK), "", self)
+        self.adblock_btn.setToolTip("Bloqueador de Anúncios (Ctrl+Shift+A)")
+        self.adblock_btn.triggered.connect(self.show_adblock_panel)
+        self.toolbar.addAction(self.adblock_btn)
+        
+        # Badge de contagem de bloqueios
+        self._adblock_badge = QLabel("0", self)
+        self._adblock_badge.setStyleSheet("""
+            QLabel {
+                background: #FF3B3B;
+                color: white;
+                border-radius: 7px;
+                padding: 1px 4px;
+                font-size: 9px;
+                font-weight: 700;
+                min-width: 14px;
+                max-height: 14px;
+            }
+        """)
+        self._adblock_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._adblock_badge.hide()
+        
         self.extension_toolbar = ExtensionToolbar(self.extension_manager, self)
         self.toolbar.addWidget(self.extension_toolbar)
         
@@ -388,7 +430,7 @@ class MainWindow(QMainWindow):
         self._setup_find_bar()
         
         # -- TABS --
-        self.tab_widget = TabWidget(self.history_manager, self.farbling_injector)
+        self.tab_widget = TabWidget(self.history_manager, self.farbling_injector, self.adblock_injector)
         self.tab_widget.currentTabUrlChanged.connect(self.update_url_bar)
         self.tab_widget.currentTabTitleChanged.connect(self.update_title)
         self.tab_widget.hoveredUrlChanged.connect(self.show_floating_status)
@@ -597,6 +639,9 @@ class MainWindow(QMainWindow):
         
         a6 = menu.addAction(self._create_icon(Icons.SHIELD), "Fingerprint\tCtrl+Shift+F")
         a6.triggered.connect(self.show_fingerprint_panel)
+        
+        a_adblock = menu.addAction(self._create_icon(Icons.ADBLOCK), "Bloqueador de Anúncios\tCtrl+Shift+A")
+        a_adblock.triggered.connect(self.show_adblock_panel)
         
         ext_menu = menu.addMenu(self._create_icon(Icons.SHIELD), "Extensões")
         ext_menu.addAction("Gerenciar Extensões", self.show_extensions)
@@ -835,6 +880,71 @@ class MainWindow(QMainWindow):
         dl_shortcut.setShortcut("Ctrl+J")
         dl_shortcut.triggered.connect(self.show_downloads)
         self.addAction(dl_shortcut)
+
+    def _setup_adblock(self):
+        """Instala o interceptor de ad block no profile e carrega listas."""
+        from PyQt6.QtCore import QThread, pyqtSignal as Signal
+
+        profile = QWebEngineProfile.defaultProfile()
+        self._adblock_interceptor = AdBlockInterceptor(self.adblock_engine, parent=self)
+        self._adblock_interceptor.blocked.connect(self._on_ad_blocked)
+        profile.setUrlRequestInterceptor(self._adblock_interceptor)
+
+        # Carregar listas de filtro em background após 3s
+        class FilterLoadWorker(QThread):
+            done = Signal(int)
+            def __init__(self, engine):
+                super().__init__()
+                self.engine = engine
+            def run(self):
+                self.engine.load_all_lists()
+                self.done.emit(self.engine.total_rules)
+
+        def _start_filter_load():
+            self._filter_worker = FilterLoadWorker(self.adblock_engine)
+            self._filter_worker.done.connect(self._on_filters_loaded)
+            self._filter_worker.start()
+
+        QTimer.singleShot(3000, _start_filter_load)
+
+        # Atalho Ctrl+Shift+A
+        adblock_shortcut = QAction("AdBlock", self)
+        adblock_shortcut.setShortcut("Ctrl+Shift+A")
+        adblock_shortcut.triggered.connect(self.show_adblock_panel)
+        self.addAction(adblock_shortcut)
+
+    def _on_filters_loaded(self, total_rules: int):
+        """Callback quando as listas de filtro terminam de carregar."""
+        self.show_floating_status(f"🛡️ Ad Blocker: {total_rules:,} regras carregadas")
+
+    def _on_ad_blocked(self, url: str, domain: str):
+        """Callback quando uma requisição é bloqueada pelo ad block."""
+        count = self.adblock_engine.get_blocked_count()
+        self._adblock_badge.setText(str(count) if count < 1000 else f"{count // 1000}k")
+        self._adblock_badge.adjustSize()
+        self._adblock_badge.show()
+        # Posicionar badge sobre o botão de adblock na toolbar
+        try:
+            btn_widget = self.toolbar.widgetForAction(self.adblock_btn)
+            if btn_widget:
+                pos = btn_widget.pos()
+                self._adblock_badge.move(
+                    pos.x() + btn_widget.width() - self._adblock_badge.width() - 2,
+                    pos.y() + 2
+                )
+                self._adblock_badge.raise_()
+        except Exception:
+            pass
+
+    def show_adblock_panel(self):
+        """Abre o painel de controle do bloqueador de anúncios."""
+        current_domain = ""
+        tab = self.tab_widget.get_current_tab()
+        if tab:
+            url = tab.qt_view.url().toString()
+            current_domain = self.adblock_engine._extract_domain(url)
+        dlg = AdBlockPanel(self.adblock_engine, current_domain, self)
+        dlg.exec()
         
     def _on_download_requested(self, download_item):
         """Recebe pedido de download do WebEngine."""

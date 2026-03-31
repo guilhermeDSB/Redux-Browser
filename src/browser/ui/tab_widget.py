@@ -29,10 +29,11 @@ class TabWidget(QTabWidget):
     tabLoadStarted = pyqtSignal()
     tabLoadFinished = pyqtSignal(bool)
 
-    def __init__(self, history_manager, farbling_injector, parent=None):
+    def __init__(self, history_manager, farbling_injector, adblock_injector=None, parent=None):
         super().__init__(parent)
         self.history_manager = history_manager
         self.farbling_injector = farbling_injector
+        self.adblock_injector = adblock_injector
         
         self.tab_bar = ReduxTabBar(self)
         self.setTabBar(self.tab_bar)
@@ -64,7 +65,7 @@ class TabWidget(QTabWidget):
 
     def add_new_tab(self, url: str = "about:home", is_private: bool = False) -> Tab:
         """Cria e anexa uma aba nova com propriedades base."""
-        tab = Tab(self, self.history_manager, self.farbling_injector, is_private=is_private)
+        tab = Tab(self, self.history_manager, self.farbling_injector, adblock_injector=self.adblock_injector, is_private=is_private)
         
         tab.urlChanged.connect(self._handle_url_change)
         tab.titleChanged.connect(self._handle_title_change)

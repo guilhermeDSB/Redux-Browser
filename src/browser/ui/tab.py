@@ -73,11 +73,12 @@ class Tab(QWidget):
     loadStarted = pyqtSignal()
     loadFinished = pyqtSignal(bool)
 
-    def __init__(self, tab_widget, history_manager, farbling_injector, is_private=False):
+    def __init__(self, tab_widget, history_manager, farbling_injector, is_private=False, adblock_injector=None):
         super().__init__()
         self.tab_widget = tab_widget
         self.history_manager = history_manager
         self.farbling_injector = farbling_injector
+        self.adblock_injector = adblock_injector
         self.id = str(uuid.uuid4())
         self.is_private = is_private
         
@@ -150,6 +151,10 @@ class Tab(QWidget):
         # Injetar farbling baseado no DOMÍNIO da URL
         domain = self._extract_domain(url)
         self.farbling_injector.inject(self.qt_view.page(), domain)
+        
+        # Injetar filtros cosméticos do ad blocker
+        if self.adblock_injector:
+            self.adblock_injector.inject(self.qt_view.page(), domain)
         
         if self.active_engine == 0:
             self.qt_view.setUrl(QUrl(url))
