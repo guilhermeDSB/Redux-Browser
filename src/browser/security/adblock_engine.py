@@ -14,11 +14,14 @@ Listas padrão (ativadas por padrão):
   - Lista BR (Adblock Warning Removal + Portuguese)
 
 Performance:
-  - Hash-map de domínios para lookup O(1)
+  - Token hash-map para lookup O(1) de regras de rede (Brave-style)
   - Regras de hostname puro em set() para O(1) exact match
-  - Regex compilado em batch apenas para regras com wildcards
+  - LazyRegex: compilação de regex sob demanda com descarte LRU
+  - AdBlockRequest: pré-parseia URL uma vez, reutiliza no pipeline
   - Cache serializado em pickle para reload < 1s
 """
+
+from __future__ import annotations
 
 import os
 import re
@@ -26,8 +29,15 @@ import pickle
 import hashlib
 import threading
 from enum import Enum
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 from dataclasses import dataclass, field
+
+from browser.security.adblock_tokenizer import (
+    tokenize_pattern, find_best_token, EMPTY_TOKEN,
+)
+
+if TYPE_CHECKING:
+    from browser.security.adblock_request import AdBlockRequest
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +142,62 @@ class AdBlockLevel(Enum):
 
 
 # ---------------------------------------------------------------------------
+# LazyRegex — compilação sob demanda com descarte LRU
+# ---------------------------------------------------------------------------
+
+class LazyRegex:
+    """
+    Wrapper que armazena o padrão regex como string e só compila sob demanda.
+    Permite serialização via pickle (re.Pattern não é serializável facilmente).
+    Implementa descarte LRU global para limitar uso de memória.
+    """
+
+    _MAX_COMPILED = 50_000
+    _compiled_cache: dict[str, re.Pattern] = {}
+    _access_order: list[str] = []
+    _lock = threading.Lock()
+
+    __slots__ = ("_pattern_str", "_flags")
+
+    def __init__(self, pattern_str: str, flags: int = re.IGNORECASE):
+        self._pattern_str = pattern_str
+        self._flags = flags
+
+    @property
+    def pattern(self) -> str:
+        return self._pattern_str
+
+    def search(self, text: str):
+        """Compila sob demanda e faz search."""
+        compiled = LazyRegex._compiled_cache.get(self._pattern_str)
+        if compiled is None:
+            try:
+                compiled = re.compile(self._pattern_str, self._flags)
+            except re.error:
+                return None
+            with LazyRegex._lock:
+                LazyRegex._compiled_cache[self._pattern_str] = compiled
+                LazyRegex._access_order.append(self._pattern_str)
+                # Descarte LRU
+                if len(LazyRegex._compiled_cache) > LazyRegex._MAX_COMPILED:
+                    to_remove = LazyRegex._access_order[:1000]
+                    for key in to_remove:
+                        LazyRegex._compiled_cache.pop(key, None)
+                    LazyRegex._access_order = LazyRegex._access_order[1000:]
+        return compiled.search(text)
+
+    def __bool__(self):
+        return bool(self._pattern_str)
+
+    def __getstate__(self):
+        return {"pattern_str": self._pattern_str, "flags": self._flags}
+
+    def __setstate__(self, state):
+        self._pattern_str = state["pattern_str"]
+        self._flags = state["flags"]
+
+
+# ---------------------------------------------------------------------------
 # Modelo de regras
 # ---------------------------------------------------------------------------
 
@@ -149,7 +215,9 @@ class NetworkRule:
     # Para matching
     is_hostname_rule: bool = False
     hostname: str = ""
-    regex: Optional[re.Pattern] = None
+    regex: Optional[LazyRegex] = None
+    # Token para indexação (Phase 1)
+    token: int = EMPTY_TOKEN
 
 
 @dataclass
@@ -302,6 +370,12 @@ class ABPParser:
         if not is_hostname:
             compiled_regex = ABPParser._compile_pattern(pattern)
 
+        # Calcular token para indexação hash-map
+        rule_token = EMPTY_TOKEN
+        if not is_hostname:
+            tokens = tokenize_pattern(pattern)
+            rule_token = find_best_token(tokens)
+
         return NetworkRule(
             raw=("@@" if is_exception else "") + pattern + ("$" + options_str if options_str else ""),
             pattern=pattern,
@@ -312,11 +386,12 @@ class ABPParser:
             is_hostname_rule=is_hostname,
             hostname=hostname,
             regex=compiled_regex,
+            token=rule_token,
         )
 
     @staticmethod
-    def _compile_pattern(pattern: str) -> Optional[re.Pattern]:
-        """Converte padrão ABP em regex."""
+    def _compile_pattern(pattern: str) -> Optional[LazyRegex]:
+        """Converte padrão ABP em LazyRegex (compila sob demanda)."""
         try:
             # Remover || do início (significa início de domínio)
             p = pattern
@@ -342,8 +417,8 @@ class ABPParser:
             p = p.replace(r"\|", "|")
 
             regex_str = prefix + p + suffix
-            return re.compile(regex_str, re.IGNORECASE)
-        except re.error:
+            return LazyRegex(regex_str, re.IGNORECASE)
+        except Exception:
             return None
 
 
@@ -363,11 +438,14 @@ class AdBlockEngine:
         self.level: AdBlockLevel = AdBlockLevel.STANDARD
         self._lock = threading.Lock()
 
-        # Regras de rede
-        self._hostname_blocks: set = set()           # hostnames bloqueados (O(1))
+        # Regras de rede — hostname puro (O(1) lookup)
+        self._hostname_blocks: set = set()           # hostnames bloqueados
         self._hostname_exceptions: set = set()       # hostnames permitidos
-        self._network_rules: list = []               # regras com regex
-        self._network_exceptions: list = []          # exceções com regex
+
+        # Regras de rede — token hash-map (O(1) bucket lookup)
+        # {token_hash: [NetworkRule, ...]}
+        self._token_index_blocks: dict[int, list[NetworkRule]] = {}
+        self._token_index_exceptions: dict[int, list[NetworkRule]] = {}
 
         # Regras cosméticas
         self._global_cosmetic: list = []             # seletores globais (sem domínio)
@@ -385,6 +463,9 @@ class AdBlockEngine:
         # Estado de carregamento
         self._loaded = False
         self._loading = False
+
+        # Histograma de tokens para seleção de "melhor token"
+        self._token_histogram: dict[int, int] = {}
 
         # Carregar regras embutidas imediatamente
         self._load_builtin_rules()
@@ -416,25 +497,33 @@ class AdBlockEngine:
                 if rule.is_hostname_rule:
                     self._hostname_exceptions.add(rule.hostname)
                 else:
-                    self._network_exceptions.append(rule)
+                    # Indexar exceção por token
+                    bucket = self._token_index_exceptions.setdefault(rule.token, [])
+                    bucket.append(rule)
+                    self._token_histogram[rule.token] = self._token_histogram.get(rule.token, 0) + 1
             else:
                 if rule.is_hostname_rule:
                     self._hostname_blocks.add(rule.hostname)
                 else:
-                    self._network_rules.append(rule)
+                    # Indexar bloqueio por token
+                    bucket = self._token_index_blocks.setdefault(rule.token, [])
+                    bucket.append(rule)
+                    self._token_histogram[rule.token] = self._token_histogram.get(rule.token, 0) + 1
         self.total_rules += 1
 
     # ----- API pública -----
 
-    def should_block(self, url: str, resource_type: str = "",
+    def should_block(self, url_or_request, resource_type: str = "",
                      first_party_url: str = "") -> bool:
         """
         Verifica se uma URL deve ser bloqueada.
 
+        Aceita tanto a API legada (strings) quanto um AdBlockRequest pré-parseado.
+
         Args:
-            url: A URL do recurso
-            resource_type: Tipo do recurso ('script', 'image', etc.)
-            first_party_url: URL da página principal (para regras third-party)
+            url_or_request: URL string ou AdBlockRequest pré-parseado
+            resource_type: Tipo do recurso ('script', 'image', etc.) — ignorado se AdBlockRequest
+            first_party_url: URL da página principal — ignorado se AdBlockRequest
 
         Returns:
             True se a URL deve ser bloqueada
@@ -442,36 +531,73 @@ class AdBlockEngine:
         if self.level == AdBlockLevel.OFF:
             return False
 
-        url_lower = url.lower()
+        # Suportar ambas as APIs
+        from browser.security.adblock_request import AdBlockRequest
+        if isinstance(url_or_request, AdBlockRequest):
+            req = url_or_request
+        else:
+            req = AdBlockRequest.from_urls(
+                str(url_or_request), first_party_url, resource_type
+            )
 
-        # Extrair domínio da URL
-        url_domain = self._extract_domain(url_lower)
+        url_lower = req.url
+        url_domain = req.hostname
+        source_domain = req.source_hostname or url_domain
 
         # Verificar whitelist do usuário
-        if url_domain and self._is_whitelisted_domain(
-            self._extract_domain(first_party_url.lower()) if first_party_url else url_domain
-        ):
+        if source_domain and self._is_whitelisted_domain(source_domain):
             return False
 
         # 1. Verificar exceções de hostname (@@||host^)
         if url_domain and self._matches_hostname_set(url_domain, self._hostname_exceptions):
             return False
 
-        # 2. Verificar exceções de regex
-        for rule in self._network_exceptions:
-            if self._matches_rule(rule, url_lower, resource_type, first_party_url):
-                return False
+        # 2. Verificar exceções de rede via token index
+        if self._check_token_index(self._token_index_exceptions, req):
+            return False
 
         # 3. Verificar bloqueios de hostname (||host^)
         if url_domain and self._matches_hostname_set(url_domain, self._hostname_blocks):
             self._record_block(url_domain)
             return True
 
-        # 4. Verificar regras de rede com regex
-        for rule in self._network_rules:
-            if self._matches_rule(rule, url_lower, resource_type, first_party_url):
-                self._record_block(url_domain)
-                return True
+        # 4. Verificar regras de rede via token index
+        if self._check_token_index(self._token_index_blocks, req):
+            self._record_block(url_domain)
+            return True
+
+        return False
+
+    def _check_token_index(self, index: dict[int, list[NetworkRule]],
+                           req: "AdBlockRequest") -> bool:
+        """
+        Verifica se alguma regra no token-index corresponde à requisição.
+
+        Para cada token da URL, busca o bucket correspondente no índice
+        e testa as regras. Também verifica o bucket EMPTY_TOKEN (regras
+        sem token útil que precisam ser testadas contra tudo).
+        """
+        # Tokens específicos da URL
+        checked_buckets: set[int] = set()
+        for token in req.tokens:
+            if token in checked_buckets:
+                continue
+            checked_buckets.add(token)
+            bucket = index.get(token)
+            if bucket:
+                for rule in bucket:
+                    if self._matches_rule(rule, req.url, req.resource_type,
+                                          req.source_url):
+                        return True
+
+        # Bucket de regras "sem token" (EMPTY_TOKEN = 0)
+        if EMPTY_TOKEN not in checked_buckets:
+            bucket = index.get(EMPTY_TOKEN)
+            if bucket:
+                for rule in bucket:
+                    if self._matches_rule(rule, req.url, req.resource_type,
+                                          req.source_url):
+                        return True
 
         return False
 
@@ -583,10 +709,13 @@ class AdBlockEngine:
             data = {
                 "hostname_blocks": self._hostname_blocks,
                 "hostname_exceptions": self._hostname_exceptions,
+                "token_index_blocks": self._token_index_blocks,
+                "token_index_exceptions": self._token_index_exceptions,
                 "global_cosmetic": self._global_cosmetic,
                 "domain_cosmetic": self._domain_cosmetic,
                 "cosmetic_exceptions": self._cosmetic_exceptions,
                 "total_rules": self.total_rules,
+                "token_histogram": self._token_histogram,
             }
             with open(cache_path, "wb") as f:
                 pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -603,10 +732,13 @@ class AdBlockEngine:
                 data = pickle.load(f)
             self._hostname_blocks = data.get("hostname_blocks", set())
             self._hostname_exceptions = data.get("hostname_exceptions", set())
+            self._token_index_blocks = data.get("token_index_blocks", {})
+            self._token_index_exceptions = data.get("token_index_exceptions", {})
             self._global_cosmetic = data.get("global_cosmetic", [])
             self._domain_cosmetic = data.get("domain_cosmetic", {})
             self._cosmetic_exceptions = data.get("cosmetic_exceptions", {})
             self.total_rules = data.get("total_rules", 0)
+            self._token_histogram = data.get("token_histogram", {})
             self._loaded = True
             return True
         except Exception as e:

@@ -3,7 +3,7 @@ Redux Browser — Versionamento Centralizado
 """
 
 APP_NAME = "Redux Browser"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 APP_AUTHOR = "CodeSpace"
 
 # GitHub repo para auto-update

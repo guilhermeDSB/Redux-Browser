@@ -9,6 +9,7 @@ from PyQt6.QtWebEngineCore import QWebEngineUrlRequestInterceptor
 from PyQt6.QtCore import pyqtSignal, QObject
 
 from browser.security.adblock_engine import AdBlockEngine
+from browser.security.adblock_request import AdBlockRequest
 
 
 class AdBlockInterceptor(QWebEngineUrlRequestInterceptor):
@@ -78,11 +79,13 @@ class AdBlockInterceptor(QWebEngineUrlRequestInterceptor):
             resource_type = self._RESOURCE_TYPE_MAP.get(resource_type_id, "other")
             first_party_url = info.firstPartyUrl().toString()
 
-            if self.engine.should_block(url, resource_type, first_party_url):
+            # Criar AdBlockRequest pré-parseado (uma alocação por requisição)
+            request = AdBlockRequest.from_urls(url, first_party_url, resource_type)
+
+            if self.engine.should_block(request):
                 info.block(True)
                 try:
-                    first_party_domain = self.engine._extract_domain(first_party_url)
-                    self.blocked.emit(url, first_party_domain)
+                    self.blocked.emit(url, request.source_hostname or request.hostname)
                 except Exception:
                     pass
 
